@@ -322,3 +322,201 @@
     )
   )
 )
+
+
+(define-constant err-reservation-exists (err u111))
+(define-constant err-reservation-not-found (err u112))
+(define-constant err-invalid-time-slot (err u113))
+(define-constant err-too-late-to-cancel (err u114))
+(define-constant err-reservation-expired (err u115))
+
+(define-data-var reservation-fee-percentage uint u10)
+(define-data-var cancellation-window uint u144)
+
+(define-map reservations
+  { reservation-id: uint }
+  {
+    space-id: uint,
+    reserver: principal,
+    start-block: uint,
+    duration: uint,
+    reservation-fee: uint,
+    total-fee: uint,
+    status: (string-ascii 10),
+    created-at: uint
+  }
+)
+
+(define-map space-reservations
+  { space-id: uint, start-block: uint }
+  { reservation-id: uint }
+)
+
+(define-data-var next-reservation-id uint u1)
+
+(define-read-only (get-reservation (reservation-id uint))
+  (map-get? reservations { reservation-id: reservation-id })
+)
+
+(define-read-only (get-space-reservation (space-id uint) (start-block uint))
+  (map-get? space-reservations { space-id: space-id, start-block: start-block })
+)
+
+(define-read-only (calculate-reservation-fee (space-id uint) (duration uint))
+  (let ((total-fee (calculate-parking-fee duration space-id)))
+    (/ (* total-fee (var-get reservation-fee-percentage)) u100)
+  )
+)
+
+(define-read-only (is-time-slot-available (space-id uint) (start-block uint) (duration uint))
+  (let ((end-block (+ start-block duration)))
+    (and
+      (is-some (map-get? parking-spaces { space-id: space-id }))
+      (is-none (map-get? space-reservations { space-id: space-id, start-block: start-block }))
+      (> start-block stacks-block-height)
+    )
+  )
+)
+
+(define-public (make-reservation (space-id uint) (start-block uint) (duration uint))
+  (let (
+    (space (unwrap! (map-get? parking-spaces { space-id: space-id }) err-space-not-registered))
+    (reservation-id (var-get next-reservation-id))
+    (reservation-fee (calculate-reservation-fee space-id duration))
+    (total-fee (calculate-parking-fee duration space-id))
+  )
+    (asserts! (> duration u0) err-invalid-duration)
+    (asserts! (> start-block (+ stacks-block-height u10)) err-invalid-time-slot)
+    (asserts! (is-time-slot-available space-id start-block duration) err-reservation-exists)
+    
+    (try! (stx-transfer? reservation-fee tx-sender contract-owner))
+    
+    (map-set reservations
+      { reservation-id: reservation-id }
+      {
+        space-id: space-id,
+        reserver: tx-sender,
+        start-block: start-block,
+        duration: duration,
+        reservation-fee: reservation-fee,
+        total-fee: total-fee,
+        status: "active",
+        created-at: stacks-block-height
+      }
+    )
+    
+    (map-set space-reservations
+      { space-id: space-id, start-block: start-block }
+      { reservation-id: reservation-id }
+    )
+    
+    (var-set next-reservation-id (+ reservation-id u1))
+    (var-set total-revenue (+ (var-get total-revenue) reservation-fee))
+    
+    (ok reservation-id)
+  )
+)
+
+(define-public (cancel-reservation (reservation-id uint))
+  (let (
+    (reservation (unwrap! (map-get? reservations { reservation-id: reservation-id }) err-reservation-not-found))
+    (refund-amount (- (get reservation-fee reservation) (/ (get reservation-fee reservation) u10)))
+  )
+    (asserts! (is-eq tx-sender (get reserver reservation)) err-unauthorized)
+    (asserts! (is-eq (get status reservation) "active") err-reservation-not-found)
+    (asserts! 
+      (< stacks-block-height (- (get start-block reservation) (var-get cancellation-window))) 
+      err-too-late-to-cancel
+    )
+    
+    (try! (stx-transfer? refund-amount contract-owner tx-sender))
+    
+    (map-set reservations
+      { reservation-id: reservation-id }
+      (merge reservation { status: "cancelled" })
+    )
+    
+    (map-delete space-reservations 
+      { space-id: (get space-id reservation), start-block: (get start-block reservation) }
+    )
+    
+    (var-set total-revenue (- (var-get total-revenue) refund-amount))
+    
+    (ok refund-amount)
+  )
+)
+
+(define-public (claim-reserved-parking (reservation-id uint))
+  (let (
+    (reservation (unwrap! (map-get? reservations { reservation-id: reservation-id }) err-reservation-not-found))
+    (space (unwrap! (map-get? parking-spaces { space-id: (get space-id reservation) }) err-space-not-registered))
+    (remaining-fee (- (get total-fee reservation) (get reservation-fee reservation)))
+    (user-history (get-user-history tx-sender))
+  )
+    (asserts! (is-eq tx-sender (get reserver reservation)) err-unauthorized)
+    (asserts! (is-eq (get status reservation) "active") err-reservation-not-found)
+    (asserts! (>= stacks-block-height (get start-block reservation)) err-invalid-time-slot)
+    (asserts! 
+      (<= stacks-block-height (+ (get start-block reservation) u10)) 
+      err-reservation-expired
+    )
+    
+    (try! (stx-transfer? remaining-fee tx-sender contract-owner))
+    
+    (map-set active-parking
+      { space-id: (get space-id reservation) }
+      {
+        parker: tx-sender,
+        start-time: stacks-block-height,
+        paid-duration: (get duration reservation),
+        payment: (get total-fee reservation)
+      }
+    )
+    
+    (map-set parking-spaces
+      { space-id: (get space-id reservation) }
+      (merge space { is-available: false })
+    )
+    
+    (map-set reservations
+      { reservation-id: reservation-id }
+      (merge reservation { status: "claimed" })
+    )
+    
+    (map-set user-parking-history
+      { user: tx-sender }
+      {
+        total-sessions: (+ (get total-sessions user-history) u1),
+        total-spent: (+ (get total-spent user-history) (get total-fee reservation))
+      }
+    )
+    
+    (var-set total-revenue (+ (var-get total-revenue) remaining-fee))
+    
+    (ok (get space-id reservation))
+  )
+)
+
+(define-public (set-reservation-fee-percentage (new-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-percentage u50) err-invalid-duration)
+    (var-set reservation-fee-percentage new-percentage)
+    (ok new-percentage)
+  )
+)
+
+(define-public (set-cancellation-window (new-window uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set cancellation-window new-window)
+    (ok new-window)
+  )
+)
+
+(define-read-only (get-reservation-settings)
+  {
+    reservation-fee-percentage: (var-get reservation-fee-percentage),
+    cancellation-window: (var-get cancellation-window)
+  }
+)
