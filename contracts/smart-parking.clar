@@ -155,6 +155,18 @@
       }
     )
     
+    (let ((points-earned (calculate-points-earned fee))
+          (current-points (get-user-points tx-sender)))
+      (map-set user-loyalty-points
+        { user: tx-sender }
+        {
+          total-points: (+ (get total-points current-points) points-earned),
+          total-earned: (+ (get total-earned current-points) points-earned),
+          total-redeemed: (get total-redeemed current-points)
+        }
+      )
+    )
+    
     (var-set total-revenue (+ (var-get total-revenue) fee))
     (ok fee)
   )
@@ -203,6 +215,18 @@
         total-sessions: (get total-sessions user-history),
         total-spent: (+ (get total-spent user-history) fee)
       }
+    )
+    
+    (let ((points-earned (calculate-points-earned fee))
+          (current-points (get-user-points tx-sender)))
+      (map-set user-loyalty-points
+        { user: tx-sender }
+        {
+          total-points: (+ (get total-points current-points) points-earned),
+          total-earned: (+ (get total-earned current-points) points-earned),
+          total-redeemed: (get total-redeemed current-points)
+        }
+      )
     )
     
     (var-set total-revenue (+ (var-get total-revenue) fee))
@@ -491,6 +515,18 @@
       }
     )
     
+    (let ((points-earned (calculate-points-earned (get total-fee reservation)))
+          (current-points (get-user-points tx-sender)))
+      (map-set user-loyalty-points
+        { user: tx-sender }
+        {
+          total-points: (+ (get total-points current-points) points-earned),
+          total-earned: (+ (get total-earned current-points) points-earned),
+          total-redeemed: (get total-redeemed current-points)
+        }
+      )
+    )
+    
     (var-set total-revenue (+ (var-get total-revenue) remaining-fee))
     
     (ok (get space-id reservation))
@@ -519,4 +555,81 @@
     reservation-fee-percentage: (var-get reservation-fee-percentage),
     cancellation-window: (var-get cancellation-window)
   }
+)
+
+(define-constant err-insufficient-points (err u116))
+(define-constant err-invalid-points (err u117))
+
+(define-data-var points-per-stx uint u1)
+(define-data-var min-redemption-points uint u100)
+(define-data-var stx-per-point uint u1)
+
+(define-map user-loyalty-points
+  { user: principal }
+  { 
+    total-points: uint,
+    total-earned: uint,
+    total-redeemed: uint
+  }
+)
+
+(define-read-only (get-user-points (user principal))
+  (default-to
+    { total-points: u0, total-earned: u0, total-redeemed: u0 }
+    (map-get? user-loyalty-points { user: user })
+  )
+)
+
+(define-read-only (get-loyalty-settings)
+  {
+    points-per-stx: (var-get points-per-stx),
+    min-redemption-points: (var-get min-redemption-points),
+    stx-per-point: (var-get stx-per-point)
+  }
+)
+
+(define-read-only (calculate-points-earned (payment uint))
+  (* payment (var-get points-per-stx))
+)
+
+(define-read-only (calculate-redemption-value (points uint))
+  (/ points (var-get stx-per-point))
+)
+
+(define-public (redeem-points (points uint))
+  (let (
+    (user-points (get-user-points tx-sender))
+    (redemption-value (calculate-redemption-value points))
+  )
+    (asserts! (>= points (var-get min-redemption-points)) err-invalid-points)
+    (asserts! (>= (get total-points user-points) points) err-insufficient-points)
+    
+    (try! (stx-transfer? redemption-value contract-owner tx-sender))
+    
+    (map-set user-loyalty-points
+      { user: tx-sender }
+      {
+        total-points: (- (get total-points user-points) points),
+        total-earned: (get total-earned user-points),
+        total-redeemed: (+ (get total-redeemed user-points) points)
+      }
+    )
+    
+    (ok redemption-value)
+  )
+)
+
+(define-public (set-loyalty-settings (new-points-per-stx uint) (new-min-redemption uint) (new-stx-per-point uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-points-per-stx u0) err-invalid-points)
+    (asserts! (> new-min-redemption u0) err-invalid-points)
+    (asserts! (> new-stx-per-point u0) err-invalid-points)
+    
+    (var-set points-per-stx new-points-per-stx)
+    (var-set min-redemption-points new-min-redemption)
+    (var-set stx-per-point new-stx-per-point)
+    
+    (ok true)
+  )
 )
