@@ -633,3 +633,311 @@
     (ok true)
   )
 )
+
+;; Parking Violation and Fine Management System
+(define-constant err-violation-not-found (err u118))
+(define-constant err-invalid-violation-type (err u119))
+(define-constant err-violation-already-disputed (err u120))
+(define-constant err-dispute-window-expired (err u121))
+(define-constant err-violation-already-paid (err u122))
+(define-constant err-no-active-parking (err u123))
+
+;; Violation types: 0=overstay, 1=unauthorized, 2=blocking, 3=other
+(define-data-var base-fine-amount uint u50)
+(define-data-var overstay-multiplier uint u2)
+(define-data-var unauthorized-multiplier uint u3)
+(define-data-var blocking-multiplier uint u4)
+(define-data-var repeat-offender-multiplier uint u2)
+(define-data-var dispute-window-blocks uint u1440) ;; ~10 days assuming 10 min blocks
+(define-data-var platform-violation-fee-percentage uint u20) ;; 20% to platform
+(define-data-var next-violation-id uint u1)
+
+(define-map violations
+  { violation-id: uint }
+  {
+    space-id: uint,
+    violator: principal,
+    reporter: principal,
+    violation-type: uint,
+    fine-amount: uint,
+    reported-at: uint,
+    status: (string-ascii 20), ;; "pending", "paid", "disputed", "resolved"
+    evidence: (string-ascii 200),
+    is-repeat-offender: bool
+  }
+)
+
+(define-map violation-disputes
+  { violation-id: uint }
+  {
+    disputer: principal,
+    dispute-reason: (string-ascii 200),
+    disputed-at: uint,
+    admin-decision: (string-ascii 100),
+    resolved-at: uint
+  }
+)
+
+(define-map user-violation-history
+  { user: principal }
+  {
+    total-violations: uint,
+    total-fines-paid: uint,
+    repeat-offenses: uint
+  }
+)
+
+(define-read-only (get-violation (violation-id uint))
+  (map-get? violations { violation-id: violation-id })
+)
+
+(define-read-only (get-dispute (violation-id uint))
+  (map-get? violation-disputes { violation-id: violation-id })
+)
+
+(define-read-only (get-user-violation-history (user principal))
+  (default-to
+    { total-violations: u0, total-fines-paid: u0, repeat-offenses: u0 }
+    (map-get? user-violation-history { user: user })
+  )
+)
+
+(define-read-only (is-repeat-offender (user principal))
+  (let ((history (get-user-violation-history user)))
+    (>= (get total-violations history) u3)
+  )
+)
+
+(define-read-only (calculate-violation-fine (violation-type uint) (is-repeat bool))
+  (let (
+    (base-fine (var-get base-fine-amount))
+    (type-multiplier 
+      (if (is-eq violation-type u0) 
+        (var-get overstay-multiplier)
+        (if (is-eq violation-type u1)
+          (var-get unauthorized-multiplier)
+          (if (is-eq violation-type u2)
+            (var-get blocking-multiplier)
+            u1
+          )
+        )
+      )
+    )
+    (repeat-multiplier (if is-repeat (var-get repeat-offender-multiplier) u1))
+  )
+    (* (* base-fine type-multiplier) repeat-multiplier)
+  )
+)
+
+(define-read-only (get-violation-settings)
+  {
+    base-fine-amount: (var-get base-fine-amount),
+    overstay-multiplier: (var-get overstay-multiplier),
+    unauthorized-multiplier: (var-get unauthorized-multiplier),
+    blocking-multiplier: (var-get blocking-multiplier),
+    repeat-offender-multiplier: (var-get repeat-offender-multiplier),
+    dispute-window-blocks: (var-get dispute-window-blocks),
+    platform-violation-fee-percentage: (var-get platform-violation-fee-percentage)
+  }
+)
+
+;; Report a parking violation
+(define-public (report-violation (space-id uint) (violator principal) (violation-type uint) (evidence (string-ascii 200)))
+  (let (
+    (space (unwrap! (map-get? parking-spaces { space-id: space-id }) err-space-not-registered))
+    (violation-id (var-get next-violation-id))
+    (is-repeat (is-repeat-offender violator))
+    (fine-amount (calculate-violation-fine violation-type is-repeat))
+  )
+    ;; Only space owner can report violations
+    (asserts! (is-eq tx-sender (get owner space)) err-unauthorized)
+    ;; Valid violation types: 0-3
+    (asserts! (<= violation-type u3) err-invalid-violation-type)
+    
+    (map-set violations
+      { violation-id: violation-id }
+      {
+        space-id: space-id,
+        violator: violator,
+        reporter: tx-sender,
+        violation-type: violation-type,
+        fine-amount: fine-amount,
+        reported-at: stacks-block-height,
+        status: "pending",
+        evidence: evidence,
+        is-repeat-offender: is-repeat
+      }
+    )
+    
+    (var-set next-violation-id (+ violation-id u1))
+    (ok violation-id)
+  )
+)
+
+;; Pay violation fine
+(define-public (pay-violation-fine (violation-id uint))
+  (let (
+    (violation (unwrap! (map-get? violations { violation-id: violation-id }) err-violation-not-found))
+    (platform-fee (/ (* (get fine-amount violation) (var-get platform-violation-fee-percentage)) u100))
+    (owner-share (- (get fine-amount violation) platform-fee))
+    (space (unwrap! (map-get? parking-spaces { space-id: (get space-id violation) }) err-space-not-registered))
+    (user-history (get-user-violation-history tx-sender))
+  )
+    ;; Only violator can pay
+    (asserts! (is-eq tx-sender (get violator violation)) err-unauthorized)
+    ;; Violation must be pending
+    (asserts! (is-eq (get status violation) "pending") err-violation-already-paid)
+    
+    ;; Transfer platform fee to contract owner
+    (try! (stx-transfer? platform-fee tx-sender contract-owner))
+    ;; Transfer owner share to space owner
+    (try! (stx-transfer? owner-share tx-sender (get reporter violation)))
+    
+    ;; Update violation status
+    (map-set violations
+      { violation-id: violation-id }
+      (merge violation { status: "paid" })
+    )
+    
+    ;; Update user violation history
+    (map-set user-violation-history
+      { user: tx-sender }
+      {
+        total-violations: (+ (get total-violations user-history) u1),
+        total-fines-paid: (+ (get total-fines-paid user-history) (get fine-amount violation)),
+        repeat-offenses: (if (get is-repeat-offender violation) 
+                           (+ (get repeat-offenses user-history) u1)
+                           (get repeat-offenses user-history))
+      }
+    )
+    
+    ;; Update platform revenue
+    (var-set total-revenue (+ (var-get total-revenue) platform-fee))
+    
+    (ok (get fine-amount violation))
+  )
+)
+
+;; Dispute a violation
+(define-public (dispute-violation (violation-id uint) (dispute-reason (string-ascii 200)))
+  (let (
+    (violation (unwrap! (map-get? violations { violation-id: violation-id }) err-violation-not-found))
+    (dispute-deadline (+ (get reported-at violation) (var-get dispute-window-blocks)))
+  )
+    ;; Only violator can dispute
+    (asserts! (is-eq tx-sender (get violator violation)) err-unauthorized)
+    ;; Must be within dispute window
+    (asserts! (<= stacks-block-height dispute-deadline) err-dispute-window-expired)
+    ;; Cannot dispute if already paid or disputed
+    (asserts! (is-eq (get status violation) "pending") err-violation-already-disputed)
+    ;; Cannot dispute if already disputed
+    (asserts! (is-none (map-get? violation-disputes { violation-id: violation-id })) err-violation-already-disputed)
+    
+    ;; Create dispute record
+    (map-set violation-disputes
+      { violation-id: violation-id }
+      {
+        disputer: tx-sender,
+        dispute-reason: dispute-reason,
+        disputed-at: stacks-block-height,
+        admin-decision: "",
+        resolved-at: u0
+      }
+    )
+    
+    ;; Update violation status
+    (map-set violations
+      { violation-id: violation-id }
+      (merge violation { status: "disputed" })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Resolve dispute (admin only)
+(define-public (resolve-dispute (violation-id uint) (upheld bool) (admin-decision (string-ascii 100)))
+  (let (
+    (violation (unwrap! (map-get? violations { violation-id: violation-id }) err-violation-not-found))
+    (dispute (unwrap! (map-get? violation-disputes { violation-id: violation-id }) err-violation-not-found))
+  )
+    ;; Only contract owner can resolve disputes
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    ;; Must be disputed status
+    (asserts! (is-eq (get status violation) "disputed") err-violation-not-found)
+    
+    ;; Update dispute with admin decision
+    (map-set violation-disputes
+      { violation-id: violation-id }
+      (merge dispute {
+        admin-decision: admin-decision,
+        resolved-at: stacks-block-height
+      })
+    )
+    
+    ;; Update violation status based on decision
+    (map-set violations
+      { violation-id: violation-id }
+      (merge violation { 
+        status: (if upheld "pending" "resolved")
+      })
+    )
+    
+    (ok upheld)
+  )
+)
+
+;; Configure violation system settings (admin only)
+(define-public (set-violation-settings 
+  (new-base-fine uint) 
+  (new-overstay-mult uint) 
+  (new-unauthorized-mult uint) 
+  (new-blocking-mult uint)
+  (new-repeat-mult uint)
+  (new-dispute-window uint)
+  (new-platform-fee-pct uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-base-fine u0) err-invalid-duration)
+    (asserts! (> new-overstay-mult u0) err-invalid-duration)
+    (asserts! (> new-unauthorized-mult u0) err-invalid-duration)
+    (asserts! (> new-blocking-mult u0) err-invalid-duration)
+    (asserts! (> new-repeat-mult u0) err-invalid-duration)
+    (asserts! (> new-dispute-window u0) err-invalid-duration)
+    (asserts! (<= new-platform-fee-pct u50) err-invalid-duration)
+    
+    (var-set base-fine-amount new-base-fine)
+    (var-set overstay-multiplier new-overstay-mult)
+    (var-set unauthorized-multiplier new-unauthorized-mult)
+    (var-set blocking-multiplier new-blocking-mult)
+    (var-set repeat-offender-multiplier new-repeat-mult)
+    (var-set dispute-window-blocks new-dispute-window)
+    (var-set platform-violation-fee-percentage new-platform-fee-pct)
+    
+    (ok true)
+  )
+)
+
+;; Auto-report overstay violation when parking ends beyond paid duration
+(define-public (report-overstay-violation (space-id uint))
+  (let (
+    (parking (unwrap! (map-get? active-parking { space-id: space-id }) err-no-active-parking))
+    (space (unwrap! (map-get? parking-spaces { space-id: space-id }) err-space-not-registered))
+    (end-time (+ (get start-time parking) (get paid-duration parking)))
+  )
+    ;; Only space owner can report overstay
+    (asserts! (is-eq tx-sender (get owner space)) err-unauthorized)
+    ;; Current time must exceed paid duration
+    (asserts! (> stacks-block-height end-time) err-invalid-duration)
+    
+    ;; Auto-report with calculated evidence
+    (report-violation 
+      space-id 
+      (get parker parking) 
+      u0 ;; overstay violation type
+      "Automated overstay detection - exceeded paid duration"
+    )
+  )
+)
+
+
